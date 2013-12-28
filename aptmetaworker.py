@@ -9,10 +9,6 @@
 ## This is free software, and you are welcome to redistribute it
 ## under certain conditions; see copying for details.
 import sys
-my_boto_ver = "boto-2.1.1"
-my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
-sys.path.append( sys.path[0] )
-sys.path[0] = my_boto_path
 
 import threading
 from boto.s3.connection import S3Connection

@@ -10,10 +10,6 @@
 
 ## Mirrors apt repositories to Amazon S3
 import sys
-my_boto_ver = "boto-2.1.1"
-my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
-sys.path.append( sys.path[0] )
-sys.path[0] = my_boto_path
 
 from aptmetaworker import MetaS3Worker
 from http2s3worker import HTTP2S3Worker
