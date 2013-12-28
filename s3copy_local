@@ -1,0 +1,318 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
+from boto.s3.bucket import Bucket
+from s3syncworker import S3SyncWorker
+from multiprocessing import Process, Pool, Queue, Event
+from Queue import Queue as tQueue
+import multiprocessing
+import threading
+import hashlib
+import argparse
+import logging
+import sys
+import os
+import time
+import re
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger('_s3local_')
+logger.setLevel(logging.DEBUG)
+
+
+def md5_queue(checksum_queue, checked_queue, directory, creds, add_new, destination, remote_keys):
+	"""
+		Get the MD5 checksum for the local files. This is important because it the
+		hash is used to determine whether or not to synchronize the files. It does
+		take a bit of time to do this, especially on large file bases, but it saves
+		money and time bandwidth by doing the checking.
+	"""
+	p = multiprocessing.current_process()
+	key = Key()	# generic key
+	conn = None
+	bucket = None
+	apt_re = re.compile('dists/.*$')
+
+	while not checksum_queue.empty():
+
+		local = None
+		m = None
+		md5 = None
+		md5_encoded = None
+
+		try:
+
+			local = checksum_queue.get()
+			remote = local.replace('%s/' % directory, '')
+
+			f = open(local)
+			md5,md5_encoded = key.compute_md5( f )
+			f.close()
+			m = local, remote, md5, md5_encoded
+
+			if not add_new or apt_re.match( remote ):
+				if remote in remote_keys:
+					if remote_keys[ remote ] == md5:
+						logger.info("%s-%s: SAME %s %s" % ( p.name, p.pid, md5, remote ))
+						continue
+					else:
+						logger.info("%s-%s: UPDATE required %s | %s | %s" % ( p.name, p.pid, md5, remote_key.etag.replace('"',''), remote ))
+
+			checked_queue.put( m )
+			logger.info("%s-%s: MD5: %s | %s " % ( p.name, p.pid, md5, remote))
+
+		except Queue.Empty, e:
+			logger.debug("%s-%s another worker stole my item, continuing if nothing happened..." % ( p.name, p.pid ))
+
+			if checksum_queue.empty():
+				break
+			else:
+				continue
+
+		except Exception, e:
+			logger.debug("%s-%s encountered problem on %s" % ( p.name, p.pid, local ) )
+			print e
+
+	logger.debug("%s-%s MD5 sum worker exiting" % (p.name, p.pid) )
+
+def main(directory, destination, secret_key, access_key, max_workers=6, max_threads=32, 
+		add_new=False, aptmirror=False, update_all=False):
+	"""
+	directory is the directory to be sync'd
+	destination is the bucket to put the files in
+	secret_key is the AWS secret key
+	access_key is the AWS access key
+	max_workers it the number of MD5 checksum process to run
+	max_threads is the number of S3 threaded workers to run
+
+	This function populates three queues
+		work_queue is where the threaded S3 copy agents work
+		checksum_queue is where the queue where files to be checksummed are checked
+		checked_queue is where the files already checked are stored
+
+	The general work flow is:
+		- Discovery of all files
+		- Start checksumming the files
+		- Start up the workers to do the synchronization
+		- Feed the checked_queue into the work_queue
+		- Wait on the work queue to finish
+		- Clean up
+
+	The reason for the mix of threads and multiprocess is performance. With
+	gathering the MD5 sums, we are CPU and disk bound and hence using multiprocess makes
+	sense. But for the actual synchronization, we are I/O bound and threads really
+	shine for that sort of work
+
+	The default of 32 S3 worker threads to 5 MD5 worker processes is just about right. If
+	you play with the ratio, you might get some better performance, but I wouldn't expect
+	too much more -- the goal should be to consume the S3 worker queue as fast as the MD5
+	workers can fill it with out making things too slow.
+
+	"""
+
+	logger.info("Starting S3 local copy process")
+	logger.info("Synchronizing %s to S3 Bucket %s" % (directory, destination))
+
+	creds = access_key, secret_key
+
+	'''Queues for work synchronization and messaging'''
+	work_queue = tQueue()						#queue for threaded S3 Copy Agents
+	checksum_queue = Queue()					#queue for multiprocessing work
+	checked_queue = Queue(maxsize=400) 			#queue for multiprocessing checksummed files
+	work_done = threading.Event()				#Signal done to s3 thread workers
+	work_done.clear()
+
+	'''Get a listing of the bucket for comparison'''
+	remote_keys = {}
+	conn = S3Connection(creds[0], creds[1])
+	bucket = conn.get_bucket( destination )
+
+	logger.info("Gathering existing keys for calculating new keys...this could take a while.")
+	for key in bucket.list():
+		remote_keys[ key.name ] = str(key.etag).replace('"','')
+
+	logger.info("Found %s remote keys" % len(remote_keys) )
+
+	'''Get directory listing for synchronization'''
+	logger.info("Populating source queue...this could also take a while")
+	apt_re = re.compile('dists/.*$')
+	new_files = False
+
+	for dirname, dirnames, filenames in os.walk(directory):
+		for filename in filenames:
+			f = os.path.join(dirname, filename)
+			rname = f.replace('%s/' % directory, '')
+
+			'''if in 'add_new' mode, we check to see if the key exists'''
+			if add_new:
+				if aptmirror and apt_re.match( rname ):
+					'''assume that apt meta has been changed'''
+					checksum_queue.put ( f )
+				elif rname not in remote_keys:
+					checksum_queue.put( f )
+				else:
+					logger.info("EXCLUDING existing %s" % rname )
+
+				if rname not in remote_keys:
+					new_files = True
+			else:
+				checksum_queue.put( f )
+				new_files = True
+
+	if not new_files:
+		logger.critical("No files to consider. Aborting")
+		sys.exit(1)
+
+	no_check = False
+	if add_new:
+		no_checked = True
+
+	'''Start calculating the MD5's'''
+	pqueue = []
+	logger.info("Starting %s workers to calculate MD5 sums" % max_workers)
+	for i in range(max_workers):
+		logger.info("Starting multiprocessing worker number %s" % i )
+		p = Process(name="W%s" % i, target=md5_queue,
+			args=(checksum_queue, checked_queue, directory, creds, no_check, destination, remote_keys ))
+		p.daemon = True
+		p.start()
+		pqueue.append(p)
+
+	'''Start the S3 worker threads'''
+	wqueue = []
+	checked = False
+	if add_new or update_all:
+		checked = True
+
+	for i in range(max_threads):
+		logger.debug("Starting worker thread [ %s/%s ]" % (i, max_threads))
+		tname = "%s" % i
+
+		if i < 10:
+			tname = "0%s" % i
+
+		worker = S3SyncWorker(work_queue, work_done, destination, logger, creds, pre_checked=checked)
+		worker.name = "S3-T%s" % tname
+		worker.start()
+		wqueue.append(worker)
+
+	time.sleep(1)	# allow workers to spawn
+	logger.debug("All worker threads started.")
+
+	"""
+	Feed the checked queue into the s3 worker threaded queue. We can't use a multiprocessing
+	queue in a thread, so we have to recreate it.
+	"""
+	logger.debug("Feeding worker thread queue...")
+	counter = 0			# queues only have an estimate of size, so we count
+	meta_list = []	 	# temporary holding for apt_meta
+	while not checked_queue.empty() or not checksum_queue.empty():
+		if checked_queue.empty():
+			pass
+		else:
+			counter += 1
+			item = checked_queue.get()
+
+			if apt_re.match( item[1] ):
+				meta_list.append( item )
+				logger.debug("APT meta-data file %s will be delayed till end" % item[1] )
+			else:
+				work_queue.put( item )
+
+	'''wait for regular files to be populated'''
+	while not work_queue.empty():
+		pass
+	logger.info("Regular files have been processed")
+
+	'''populate work_queue with meta_files'''
+	for item in meta_list:
+		work_queue.put( item )
+		meta_list.remove( item )
+		logger.debug("APT meta-data file %s added to queue for processing" % item[1] )
+
+	if aptmirror:
+		logger.debug("APT Repository meta-data has been queued for processing")
+
+	logger.debug("Worker queue has been feed")
+
+	'''Close the queues, since they are no longer needed'''
+	checked_queue.close()
+	checksum_queue.close()
+	logger.debug("Checksum queues are now closed")
+
+	while not work_queue.empty():
+		logger.debug("Items in queue is %s" % work_queue.qsize() )
+		time.sleep(1)
+
+	work_done.set()
+	'''Make sure all the md5 workers come home'''
+	while len(pqueue)  > 0:
+		for p in pqueue:
+			if p.is_alive():
+				time.sleep(1)
+				continue
+			else:
+				p.join()
+				pqueue.remove(p)
+	logger.debug("All MD5 Workers are finished")
+
+	'''Signal the workers we are done'''
+	logger.debug("Signaled threads to end")
+	work_done.set()
+
+	logger.info("Total files synchronized was %s" % counter )
+	sys.exit(0)
+
+
+if __name__=="__main__":
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--directory', action="store",
+		help="Directory to syncronize")
+	parser.add_argument('--destination', action="store",
+		help="Destination bucket on S3")
+	parser.add_argument('--secret_key', action="store",
+		help="AWS Secret Key")
+	parser.add_argument('--access_key', action="store",
+		help="AWS Access Key/ID")
+	parser.add_argument('--s3workers', action="store", type=int, default=32,
+		help="Number of S3 worker threads, default is 32, most users should not adjust this")
+	parser.add_argument('--md5workers', action="store", type=int, default=6,
+		help="Number of workers for MD5 calculations, default is 5, most users should not adjust this")
+	parser.add_argument('--add_new', action="store_true", default=False,
+		help="Add new files only to bucket")
+	parser.add_argument('--update_all', action="store_true", default=False,
+		help="Update existing files")
+	parser.add_argument('--aptmirror', action="store_true", default=False,
+		help="Add new files and update meta-data")
+
+	opts = parser.parse_args()
+	error=False
+
+	if not opts.access_key or not opts.secret_key:
+		logger.error("Please provide AWS access and secret key via --secret_key and --access_key. See --help.")
+		error=True
+
+	if not opts.directory:
+		logger.error("Please provide directory for synchronization from via --directory. See --help.")
+		error=True
+
+	if not opts.destination:
+		logger.error("Please provide bucket for synchronization to via --destination. See --help.")
+		error=True
+
+	if error:
+		logger.error("Improper or incomplete command line invocation.")
+		sys.exit(1)
+
+	main(opts.directory, opts.destination, opts.secret_key, opts.access_key,
+		max_threads=opts.s3workers, max_workers=opts.md5workers, add_new=opts.add_new,
+		aptmirror=opts.aptmirror, update_all=opts.update_all)

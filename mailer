@@ -1,0 +1,76 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+
+import smtplib
+from email.mime.text import MIMEText
+import argparse
+import sys
+
+
+def mail(subject, me, you, host, port, user=None, pwd=None, message=None, file_name=None, ssl=True):
+
+	if file_name:
+		fp = open( file_name )
+		message = fp.read()
+		fp.close()
+
+	msg = MIMEText(message)
+
+	msg['Subject'] = subject
+	msg['From'] = me
+	msg['To'] = you
+
+	s = None
+
+	if ssl:
+		s = smtplib.SMTP_SSL( host, port )
+	else:
+		s = stmplib.SMTP( host, port )
+
+	if user and pwd:
+		s.login( user, pwd )
+
+	s.sendmail( me, [you], msg.as_string() )
+	s.quit()
+
+if __name__=="__main__":
+
+	parser = argparse.ArgumentParser()
+
+	parser.add_argument('--subject', action="store",
+		help="Subject of the email")
+	parser.add_argument('--user', action="store", default=None,
+		help="Username for SMTP connection")
+	parser.add_argument('--pwd', action="store", default=None,
+		help="Password of user")
+	parser.add_argument('--sender', action="store",
+		help="Source email address")
+	parser.add_argument('--to', action="store",
+		help="Destination email address")
+	parser.add_argument('--host', action="store",
+		help="STMP host")
+	parser.add_argument('--port', action="store", type=int, default=465,
+		help="STMP host port")
+	parser.add_argument("--ssl", action="store_true", default=True,
+		help="Use SSL")
+	parser.add_argument("--message", action="store", default=None,
+		help="Message to send")
+	parser.add_argument("--file_name", action="store", default=None,
+		help="File to send")
+
+	opts = parser.parse_args()
+
+	if not opts.message and not opts.file_name:
+		print "Must use either --message or --file_name"
+		sys.exit(1)
+
+	mail(opts.subject, opts.sender, opts.to, opts.host, opts.port, opts.user,
+		opts.pwd, message=opts.message, file_name=opts.file_name, ssl=opts.ssl)
+

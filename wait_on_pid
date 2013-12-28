@@ -1,0 +1,85 @@
+#!/bin/bash
+#
+# Copyright (C) 2011, Ben Howard <ben.howard@canonical.com>
+#
+# This file is part of s3aptmirror.
+# s3aptmirror is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+#
+# s3aptmirror is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+## Watches a PID and then times it out
+
+PID=$1
+TIMEOUT=$2
+GRANULARITY=$3
+count=0
+
+Usage() {
+cat <<EOF
+Useage: ${0##/} PID TIMEOUT GRANULARITY
+	PID: PID to watch
+	TIMEOUT Ns|Nm|Nh) Time out for PID
+	GRANULARITY Ns|Nm|Hh) How often to check
+
+	Ns: Number of seconds
+	Nm: Number of minutes
+	Nh: Number of hours
+
+	All times default to seconds
+
+	Example: ( do_stuff ) & wait_on_pid $! 1h 5m
+	     ( wait on subshell up to one hour and time out
+			after 5 minutes )
+EOF
+}
+
+[ $# -ne 3 ] && { Usage; exit 1; }
+
+# set the maxcount
+maxcount=0
+case "${TIMEOUT}" in
+	*m)	maxcount=$( expr "${TIMEOUT%%[a-z]}" \* 60 );;
+	*h) maxcount=$( expr "${TIMEOUT%%[a-z]}" \* 60 \* 60 );;
+	*) maxcount="${TIMEOUT%%[a-z]}";;
+esac
+
+# how much to increment counter by
+increment_by=0
+case "${GRANULARITY}" in
+	*m) increment_by=$(expr "${GRANULARITY%%[a-z]}" \* 60 );;
+	*h) increment_by=$(expr "${GRANULARITY%%[a-z]}" \* 60 \* 60 );;
+	*) increment_by="${GRANULARITY%%[a-z]}";;
+esac
+
+# check if PID exists first...
+if [ "$( ps -p ${PID} > /dev/null; echo $? )"  -eq "1" ]
+then
+	echo "PID ${PID} does not exist, exiting"
+	exit 0
+else
+	echo "Watching PID ${PID}. Time out set to ${TIMEOUT}. Checking every ${GRANULARITY}"
+fi
+
+# now wait and watch
+while [ "$( ps -p ${PID} > /dev/null; echo $? )" -eq "0" -a "${count}" -le "${maxcount}" ]
+do
+	sleep ${GRANULARITY}
+	count=$( expr "${count}" + "${increment_by}" )
+done
+
+# kill the PID if it remains
+if [ $( ps -p ${PID} > /dev/null; echo $? ) -ne "1" ]
+then
+	kill -9 ${PID} &&
+		echo "PID ${PID} terminated" ||
+		echo "PID ${PID} remains...oh well"
+
+	exit 1
+fi
+
+exit 0
+

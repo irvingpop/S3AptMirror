@@ -1,0 +1,60 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## Script for doing builds with live-build system in an automated fashion
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+import sys
+my_boto_ver = "boto-2.1.1"
+my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
+sys.path.append( sys.path[0] )
+sys.path[0] = my_boto_path
+
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
+from boto.s3.bucket import Bucket
+from s3copyworker import S3CopyWorker
+
+import argparse
+import logging
+import re
+import Queue
+
+def main(bucket, directory, access_key, secret_key):
+	creds = access_key, secret_key
+	conn = S3Connection(access_key, secret_key)
+	buck = conn.get_bucket(bucket)
+
+	for k in buck.list(prefix=directory):
+		print k.name
+
+if __name__=="__main__":
+	parser = argparse.ArgumentParser()
+
+	parser.add_argument('--bucket',
+		action="store",
+		required=True,
+		help="Bucket")
+	parser.add_argument('--directory',
+		action="store",
+		required=True,
+		help="Bucket directory")
+	parser.add_argument('--secret_key',
+		action="store",
+		required=True,
+		help="AWS Secret Key")
+	parser.add_argument('--access_key',
+		action="store",
+		required=True,
+		help="AWS Access Key")
+
+	results = parser.parse_args()
+	main(results.bucket,
+		results.directory,
+		results.access_key,
+		results.secret_key)
+

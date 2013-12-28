@@ -1,0 +1,69 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
+from boto.s3.bucket import Bucket
+from s3deleteworker import S3DeleteWorker
+import argparse
+import logging
+import Queue
+import sys
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger('_s3deleter')
+logger.setLevel(logging.DEBUG)
+
+def main(root, buck, access_key, secret_key, max_threads=32):
+	logger.info("Starting S3 delete process")
+	logger.info("Establishing connections to buckets")
+	creds = access_key, secret_key
+	conn = S3Connection( access_key, secret_key )
+	file_bucket = conn.get_bucket(buck)
+	logger.debug("Connections established")
+
+	work_queue = Queue.Queue()
+	logger.info("Populating file queue...")
+
+	for key in file_bucket.list(prefix=root):
+		logger.info("Queuing %s for deletion - %s" % (key.name, key.etag))
+		work_queue.put(key.name)
+
+	logger.info("Work queue has %s items" % work_queue.qsize())
+
+	if work_queue.empty():
+		logger.info("No items to delete.")
+		sys.exit(0)
+
+	for i in range(max_threads):
+		logger.debug("Starting worker thread [ %s/%s ]" % ( i, max_threads ))
+		tname = "T-%s" % i
+
+		if i < 10:
+			tname = "T-0%s" % i
+
+		deleter = S3DeleteWorker(work_queue, buck, logger, creds, tname )
+		deleter.start()
+
+	work_queue.join()
+
+if __name__=="__main__":
+	parser = argparse.ArgumentParser()
+
+	parser.add_argument('--root', action="store", help="Subdirectory to delete", default="")
+	parser.add_argument('--bucket', action="store", help="Bucket to delete from")
+	parser.add_argument('--secret_key', action="store", help="AWS Secret Key")
+	parser.add_argument('--access_key', action="store", help="AWS Access Key")
+	parser.add_argument('--threads', action="store", help="Number of worker threads", default=32)
+
+	results = parser.parse_args()
+
+	main(results.root, results.bucket, results.access_key, results.secret_key, int(results.threads))
+

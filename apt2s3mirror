@@ -1,0 +1,714 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+
+## Mirrors apt repositories to Amazon S3
+import sys
+my_boto_ver = "boto-2.1.1"
+my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
+sys.path.append( sys.path[0] )
+sys.path[0] = my_boto_path
+
+from aptmetaworker import MetaS3Worker
+from http2s3worker import HTTP2S3Worker
+from time import strftime
+from datetime import date, timedelta
+from s3uploadobj import S3UploadObject
+from s3deleteworker import S3DeleteWorker
+from metaparser import APTParserWorker
+from aptreleaseparser import APTReleaseParser
+
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
+from boto.s3.bucket import Bucket
+
+import boto.exception
+import argparse
+import copy
+import cPickle as pickle
+import gzip
+import logging
+import hashlib
+import os
+import Queue
+import re
+import shutil
+import socket
+import sqlite3
+import sys
+import tempfile
+import time
+import threading
+import traceback
+
+run_stamp = strftime('%Y%m%d%H%M%S')
+
+def hash_name( name ):
+	m = hashlib.md5()
+	m.update( name )
+	return m.hexdigest()
+
+
+class UbuntuAPTParser():
+	def __init__(self, logger, destination, urlbase=None, dists=None,
+			workers=16, creds=None, subdir='ubuntu', srcdir='ubuntu', server='archive.ubuntu.com', parse_meta=False,
+			meta_only=False, no_meta=False, delete_delay=3, purge_old=False):
+
+		"""
+		Runs the main logic
+
+		logger: passed around for logging output
+		destination: S3 bucket to use
+		urlbase: the base URL used for the repo
+		dists: the distribution name, i.e. hardy, lucid
+		workers: the number thread workers to use
+		creds: a tuple of Amazon S3 credentials
+		subdir: under the S3 bucket, which directory to sync the repository to
+		srcidr: at the destination, where to look for the meta-data
+		server: FDQN of the server to use
+		parse_meta: should the meta-data be parsed only?
+		meta_only: do not update files to (debug only)
+		no_meta: update only the files
+		delete_delay: how many days to wait before file is eligable for purging when no longer referenced in meta-data
+		purge_old: should old files be purged too
+		"""
+
+		self.logger = logger
+		self.server = server
+		self.urlbase = "http://%s/ubuntu/dists" % self.server
+		self.distributions = [ "oneiric", "lucid", "hardy", "precise", "saucy" ]
+		self.subrepo = [ "backports", "proposed", "security", "updates" ]
+		self.dists = []
+		self.meta_parse_only = parse_meta
+		self.destination =  destination
+		self.workers = workers
+		self.subdir = subdir
+		self.srcdir = srcdir
+		self.creds = creds
+		self.queue = Queue.Queue()
+		self.meta_only = meta_only
+		self.no_meta = no_meta
+		self.delete_delay = delete_delay
+		self.purge_old = purge_old
+
+		'''create over-ride lists'''
+		if urlbase is not None:
+			self.urlbase = urlbase
+
+		if dists is not None:
+			self.distributions = dists.split()
+
+		if self.creds is None:
+			raise Exception("NO_CREDENTIALS", "S3 Credentials not provided")
+
+		for d in self.distributions:
+			self.dists.append(d)
+			for s in self.subrepo:
+				self.dists.append("%s-%s" % ( d, s ))
+
+	def get_bucket_meta( self, md5_db ):
+		"""
+		Fetch the bucket meta-data and then store it in a hashed dictionary.
+		"""
+
+		conn = S3Connection( self.creds[0], self.creds[1] )
+		bucket = conn.get_bucket( self.destination )
+
+		self.logger.info("Gathering existing keys for calculating new keys...this could take a while.")
+		count = 0
+		c = md5_db.cursor()
+
+		for key in bucket.list( prefix=self.subdir ):
+			values = hash_name(key.name), key.name, key.etag.replace('"',''), None, None, 0, 0
+			c.execute("insert into md5s values(?, ?, ?, ?, ?, ?, ?)", values)
+			count += 1
+
+			if count % 10000 == 0:
+				self.logger.debug("Gathered %s keys for consideration" % count )
+				md5_db.commit()
+
+		md5_db.commit()
+		c.close()
+
+	def prep_work_queue(self, meta_queue, tempdir):
+		"""
+			In order to prevent the datasets from getting too big we
+				return pickles of the fetch queue
+		"""
+		pickles = []
+
+		for dist in self.dists:
+			queue = Queue.Queue()
+			temp_meta_queue = Queue.Queue()
+			temp_fetch_queue = Queue.Queue()
+
+			'''get the release information'''
+			rp = APTReleaseParser('_s3local_', tempdir)
+			url = "%s/%s/Release" % ( self.urlbase, dist )
+			key_base = "%s/dists/%s" % ( self.subdir, dist )
+			key_name = "%s/Release" % key_base
+			url_base = "%s/%s" % ( self.urlbase, dist )
+			rp.parse(url, url_base, key_name, key_base, queue)
+
+			'''start the workers'''
+			threads = []
+			error = threading.Event()
+
+			'''add the Content.{bz2,gz} and release.gpg to the queue'''
+			extra_meta = "Contents-amd64.gz", "Contents-i386.gz", "Release.gpg"
+			for extra in extra_meta:
+				anon = S3UploadObject()
+				anon.set_value('remote_url', "%s/%s" % ( url_base, extra ))
+				anon.set_value('key_name', "%s/%s" % ( key_base, extra ))
+				anon.set_value('temp_name', "%s_%s_%s" % ( self.subdir, dist, extra ))
+				queue.put(anon)
+
+			for n in range(self.workers):
+				n_name = "release_parser %s" % n
+				self.logger.debug("Starting APT Meta Worker thread %s" % n_name)
+				worker = APTParserWorker('_s3local_',
+						queue,
+						temp_fetch_queue,
+						temp_meta_queue,
+						tempdir,
+						self.server,
+						self.srcdir,
+						self.subdir,
+						error)
+
+				worker.daemon = True
+				worker.name = n_name
+				threads.append( worker )
+				worker.start()
+
+			while len( threads ) > 0 and not error.is_set():
+				threads = [ t.join(1) for t in threads if t is not None and t.isAlive() ]
+				self.logger.info("Queue has %s left in it" % len( threads ))
+				time.sleep(1)
+
+			if error.is_set():
+				self.logger.critical("Error encountered while processing meta-data")
+				raise Exception("META-ERROR", "Worker signaled error, check logs")
+
+			'''wait for the queue to finish'''
+			self.logger.info("Waiting for the workers to report their status as done")
+			queue.join()
+			del queue
+
+			anon_batch = []
+			self.logger.info("Found %s Synchronous APT Meta-data update" % temp_meta_queue.qsize())
+			while not temp_meta_queue.empty():
+				anon_batch.append(temp_meta_queue.get())
+			del temp_meta_queue
+
+			if len(anon_batch) > 0:
+				meta_queue.put_nowait(anon_batch)
+
+			'''write out the fetch queue pickle'''
+			fetch_array = []
+			while not temp_fetch_queue.empty():
+				fetch_array.append(copy.deepcopy(temp_fetch_queue.get()))
+
+			fh, fhn = tempfile.mkstemp(prefix="queue-pkl-", dir=tempdir)
+			f_local = os.fdopen(fh, 'w+b')
+			pickle.dump(fetch_array, f_local)
+			f_local.close
+			pickles.append(fhn)
+			self.logger.info("Wrote fetch queue to pickle %s" % fhn)
+			del temp_fetch_queue
+			time.sleep(1)
+
+		return pickles
+
+	def depickle_fetch_queue(self, pickles):
+		"""
+			Iterator that depickles the saved queues, and then
+				iterates over the items
+		"""
+
+		for pck in pickles:
+			with open(pck, 'r+b') as f:
+				q = pickle.load(f)
+
+				self.logger.info("Pickle has %s items" % len(q))
+				for item in q:
+					yield copy.deepcopy(item)
+					del item
+
+				del q
+			f.close()
+
+	def calc_pkg_work(self, fetch_pickles, fetch_queue, md5_db, file_error):
+		"""
+			Calculate the files that need to be uploaded by iterating over
+				the items contained in the pickled queues stored in the
+				fetch_pickles
+		"""
+
+		queued = []
+		conn = S3Connection(self.creds[0], self.creds[1])
+		bucket = conn.get_bucket(self.destination)
+		count = 0
+		uploaded = 0
+		c = md5_db.cursor()
+		time_base = time.time()
+
+		self.logger.info("Calculating differences between authoritative mirror and S3 mirror")
+		for item in self.depickle_fetch_queue(fetch_pickles):
+
+			item_name = item.get_value("key_name")
+			item_md5 = item.get_value("remote_md5")
+			count += 1
+			hname = hash_name(item_name)
+			found_in_table = False
+			skip_row = False
+			upload = False
+			bad_upload = False
+			"""
+			(hash_name text, key_name text, s3_md5 text, archive_md5 text, size integer, upload integer, found integer)
+			"""
+
+			q = "select s3_md5, found, rowid, hash_name, key_name from md5s where hash_name = '%s'" % hname
+			sq = "select s3_md5, found, rowid, hash_name, key_name from md5s %s"
+
+			rows = c.execute( q )
+			s3_extra_copies_broken = False
+
+			if float(time.time()) > float((time_base + 60)):
+				self.logger.info("Processed %s items, %s total upload items" %
+									 (count, uploaded))
+				time_base = time.time()
+
+			for row in rows:
+				found_in_table = True
+				s3_extra_copies_broken = False
+				where_clause = "where hash_name = '%s'" % hname
+
+				"""
+					S3 Hack fix. For any file with a "+" in the name, we need to upload the file
+					three time. This checks to make sure that the file has been uploaded the
+					required times. This is the lazy way...
+				"""
+
+				if item_name.find("+") > 0:
+					where_clause = "where hash_name in ('%s', '%s', '%s')" % ( hname,
+						hash_name(item_name.replace('+', ' ')), hash_name(item_name.replace('+', '%2B')) )
+
+					sq = sq % where_clause
+					srows = c.execute( sq )
+
+
+					'''check variants md5'''
+					found_keys = []
+					found_count = 0
+					for row in srows:
+						found_count += 1
+						if row[0] != item_md5:
+							found_keys.append(row[4])
+							bad_upload = True
+
+					del sq
+					del srows
+
+					if found_count != 3:
+						bad_upload = True
+
+				if (row[0] == item_md5 and row[1] == 1) and not bad_upload:
+					skip_row = True
+
+				elif (row[0] == item_md5 and row[1] == 0) and not bad_upload:
+					sqlcmd="update md5s set archive_md5='%s', upload=0, found=1 %s " % ( item_md5, where_clause )
+					c.execute( sqlcmd )
+					md5_db.commit()
+
+				elif (row[0] != item_md5 and row[1] == 0) or bad_upload:
+					sqlcmd="update md5s set archive_md5='%s', upload=1, found=1 %s" %( item_md5, where_clause )
+					c.execute( sqlcmd )
+					md5_db.commit()
+					upload = True
+
+			if skip_row:
+				del item
+				continue
+
+			if not found_in_table:
+				sqlcmd = "INSERT into md5s ( hash_name, key_name, s3_md5, upload, found ) values ( '%s', '%s', '%s', 1, 1 )" % ( hname, item_name, item_md5 )
+				c.execute( sqlcmd )
+				md5_db.commit()
+				upload = True
+
+			# If the item is to be uploaded, add it to the fetch queue
+			#	this will block if the queue is full
+			if upload:
+				fetch_queue.put(copy.deepcopy(item))
+				uploaded += 1
+				del item
+
+			# Abort if the file_error has been set...why populate the queue
+			#	if it is not needed
+			if file_error.is_set():
+				raise Exception("WORKER_ERROR")
+
+	def purge(self, md5_db):
+		"""
+		Iterator over remaining_md5, tag for deletion and execute deletion workers
+		"""
+		purge_queue = Queue.Queue()
+		ready_for_purging = []
+
+		delete_tag_date = date.today()											# Date object of today
+		purge_date = date.today() + timedelta(days= int(self.delete_delay) )	# Date object when to delete
+		today_ordinal = delete_tag_date.toordinal()								# Ordinal of today
+		purge_ordinal = purge_date.toordinal()									# Ordinal of when to delete
+
+		self.logger.info("Date for delete has been set to %s" % purge_date )
+		conn = None
+		bucket = None
+		excluded = re.compile('.*ubuntu/dists.*')					# match any meta-data
+		not_excluded = ex1 = re.compile(r'.*\d{4}-\d{2}-\d{2}$')	# exclude any with a date in the name
+
+		try:
+			conn = S3Connection( self.creds[0], self.creds[1] )
+			bucket = conn.get_bucket( self.destination )
+
+		except Exception, e:
+			self.logger.critical("Unable to make connection to S3")
+
+		self.logger.info("Processing candidates for deletion or marking for deletion")
+
+		tag_count = 0
+		c = md5_db.cursor()
+
+
+		rows = c.execute('select key_name from md5s where found = 0')
+		for row in rows:
+			remaining = row[0]
+
+			if excluded.match(remaining) and not not_excluded.match(remaining):
+				self.logger.debug("Excluding meta-data %s from deletion set" % remaining)
+				continue
+
+			try:
+
+				if self.purge_old and today_ordinal == purge_ordinal:
+					'''zero-day delete for files not referenced in the meta-data'''
+					purge_queue.put( remaining )
+
+				else:
+					key =  bucket.get_key( remaining )
+
+					if key and key.get_metadata("delete_ordinal"):
+						delete_date = key.get_metadata("delete_ordinal")
+
+						if self.purge_old and delete_date >= today_ordinal:
+							purge_queue.put( remaining )
+							self.logger.debug("%s has expired its delete delay; queued for purging" % remaining)
+
+					else:
+						'''we're going to be careful and thus slow on the tagging'''
+						if key is not None and key.exists():
+							meta = {}
+							meta["delete_ordinal"] = str( purge_date.toordinal() )
+							meta["delete_on"] = str( purge_date )
+							meta["delete_tagged_on"] = str( delete_tag_date )
+
+							'''Do a perverse dance to update the meta-data'''
+							key.copy(key.bucket.name, key.name, metadata=meta, preserve_acl=True)
+							self.logger.debug("%s has been tagged for purging in %s days" % ( remaining, self.delete_delay ))
+
+			except Exception, e:
+				self.logger.debug("Error on %s\n%s" % ( remaining, e ))
+
+		self.logger.info("Tagged %s items for future deletion on %s" % ( tag_count, purge_date ))
+		self.logger.info("Found %s items for deletion" % purge_queue.qsize() )
+
+		if self.purge_old and purge_queue.qsize() > 0:
+			'''fire up the deletion workers'''
+			worker_list = []
+			for i in range( self.workers ):
+				self.logger.debug("Starting worker thread [ %s/%s ]" % ( i, self.workers ))
+				deleter = S3DeleteWorker(purge_queue, self.destination, logger, self.creds, "S3DEL-%s" % i, silent=True )
+				deleter.daemon = True
+				deleter.start()
+				worker_list.append( deleter )
+
+			while len( worker_list ) > 0:
+				worker_list = [ t.join(1) for t in worker_list if t is not None and t.isAlive() ]
+
+			purge_queue.join()
+			self.logger.debug("Finished purge process")
+
+
+	def upload(self, queue, work_type, workers=16):
+		"""
+			Upload the content of the queue to the S3
+
+			queue is a Queue.Queue that has been populated
+			work_type is either files or meta
+
+			returns the worker_list and the error object
+		"""
+
+		self.logger.info("Starting S3 Upload process with %s workers for %s " % ( workers, work_type ))
+		self.logger.info("Queue has %s work items" % queue.qsize() )
+
+		error = threading.Event()
+		populated = threading.Event()
+		worker_list = []
+		for n in range(workers):
+			worker = None
+
+			if work_type == "files":
+				worker = HTTP2S3Worker(
+							queue,
+							self.destination,
+							'_s3local_',
+							self.creds,
+							error,
+							populated,
+							)
+
+			elif work_type == "meta":
+				worker = MetaS3Worker(
+							queue,
+							self.destination,
+							'_s3local_',
+							self.creds,
+							error,
+							)
+
+			if n > 9:
+				worker.name = "UPLOAD %s-W%s" % ( work_type, n )
+			else:
+				worker.name = "UPLOAD %s-W0%s" % ( work_type, n )
+
+			worker.daemon = True
+			worker_list.append(worker)
+			worker.start()
+
+		return worker_list, error, populated
+
+	def upload_wait(self, worker_list, error, populated, work_queue):
+		"""
+			Wait on the workers to complete or error out
+		"""
+
+		while not populated.is_set() and not error.is_set():
+			time.sleep(1)
+
+		if error.is_set():
+			self.logger.debug("Worker nodes encountered error. Aborting")
+			raise Exception("WORKER_ERROR", "Worker nodes encountered error. Aborting")
+
+		self.logger.debug("Reaping the worker threads...")
+		while len( worker_list ) > 0 and not error.is_set():
+			for t in worker_list:
+				if t is not None and not t.isAlive():
+					worker_list.remove( t )
+					self.logger.debug("Thread has returned home. Remaining threads %s" % len(worker_list))
+
+		self.logger.debug("All workers have finished")
+
+	def create_tables(self, md5_db):
+		c = md5_db.cursor()
+		c.execute('''CREATE TABLE md5s (hash_name TEXT PRIMARY KEY, key_name TEXT, s3_md5 TEXT, archive_md5 TEXT, size INTEGER, upload INTEGER, found INTEGER)''')
+		md5_db.commit()
+		c.close()
+		self.logger.info("Created database")
+
+	def run(self, fetch_queue, meta_queue, db_loc="/tmp"):
+		"""
+		Gathers the prep-data, trigger the meta-flip, then finalize the meta
+		"""
+		tempdir = tempfile.mkdtemp(suffix="-s3mirror")
+		self.logger.debug("Using %s as cache directory" % tempdir )
+
+		md5_fh, md5_name = tempfile.mkstemp( prefix="s3aptmirror-sqlite.", dir=db_loc )
+		md5_db = sqlite3.connect( md5_name )
+		self.create_tables( md5_db )
+
+		self.logger.debug("Using %s as fetch URL" % self.urlbase )
+
+		self.logger.info("Processing meta-data")
+		pickles = self.prep_work_queue(meta_queue, tempdir )
+		self.logger.debug("Finsihed Preping Work Queue")
+		self.get_bucket_meta(md5_db)
+
+		workers, error, populated = None, None, None
+		mworkers, merror, mpopulated = None, None, None
+
+		# Start the workers before caluclating the queue
+		if not self.meta_parse_only and not self.meta_only:
+			workers, error, populated = \
+				self.upload(fetch_queue, "files", workers=self.workers)
+
+		# Populate the Queue
+		if not self.meta_only:
+			self.calc_pkg_work(pickles, fetch_queue, md5_db, error)
+			populated.set()
+			self.upload_wait(workers, error, populated, fetch_queue)
+
+		if error.is_set():
+			raise Exception("WORKER_ERROR")
+
+		# Start the meta workers:
+		if not self.meta_parse_only and not self.no_meta:
+			mworkers, merror, mpopulated = \
+				self.upload(meta_queue, "meta", workers=len(self.dists))
+			mpopulated.set()
+			self.upload_wait(mworkers, merror, mpopulated, meta_queue)
+
+		self.logger.info("Successfully parsed meta-data")
+
+		if self.purge_old:
+			self.purge( md5_db )
+
+		shutil.rmtree(tempdir)
+		os.unlink(md5_name)
+		self.logger.info("Finished run")
+		sys.exit(0)
+
+
+if __name__ == "__main__":
+
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--print_urls', action="store_true", default=False,
+		help="Print URLS to work on and exit")
+	parser.add_argument('--workers', action="store", default=16, type=int,
+		help="Number of workers to process meta-data")
+	parser.add_argument('--distro', action="store",
+		default="lucid oneiric precise quantal raring saucy trusty",
+		help="Distributions to mirror")
+	parser.add_argument('--destination', action="store",
+		help="Destination bucket on S3")
+	parser.add_argument('--secret_key', action="store",
+		help="AWS Secret Key")
+	parser.add_argument('--access_key', action="store",
+		help="AWS Access Key/ID")
+	parser.add_argument('--src_dir', action="store", default="ubuntu",
+		help="Remote location directory where files are")
+	parser.add_argument('--dir', action="store", default="ubuntu",
+		help="Bucket sub directory to store files")
+	parser.add_argument('--server', action="store",
+		default="archive.ubuntu.com",
+		help="Server to mirror from")
+	parser.add_argument('--meta_parse', action="store_true", default=False,
+		help="Only parse meta-data")
+	parser.add_argument('--meta_only', action="store_true", default=False,
+		help="Process only meta data (should not be used)")
+	parser.add_argument('--no_meta', action="store_true", default=False,
+		help="Upload new files, but skip meta data")
+	parser.add_argument('--purge_old', action="store_true", default=False,
+		help="Purge files not referenced in current meta-data")
+	parser.add_argument('--delete_delay', action="store", default=3,
+		help="Number of days to wait before a file is eligible for purging")
+	parser.add_argument('--log', action="store",
+		default="/tmp/apt2s3mirror-%s.log" % run_stamp,
+		help="Name of the log file to log to")
+	parser.add_argument('--db_loc', action="store", default="/tmp",
+		help="Location to store the temp DB for processing meta-data")
+	parser.add_argument('--silent', action="store_true", default=False,
+		help="Disable on-screen logging, useful for automated runs")
+
+	opts = parser.parse_args()
+
+	'''setup the logger'''
+	logger = logging.getLogger('_s3local_')
+
+	if not opts.silent:
+		logging.basicConfig(format= \
+				"%(asctime)s %(levelname)s - %(process)d " \
+				"%(threadName)s - %(message)s")
+	else:
+		print "Silently running. Please see log file at %s" % opts.log
+
+	logformat = logging.Formatter(\
+			'%(asctime)s %(levelname)s - %(process)d %(threadName)s - %(message)s')
+
+	logfile = logging.FileHandler( opts.log )
+	logfile.setFormatter( logformat )
+	logger.addHandler( logfile )
+	logger.setLevel(logging.DEBUG)
+
+	creds = None
+	if opts.secret_key and opts.access_key:
+		creds = opts.access_key, opts.secret_key
+	else:
+		logger.warn('S3 Credentials were not provided')
+		sys.exit(1)
+
+	if opts.destination is None:
+		logger.critical("Please define a bucket destination via --destination")
+		sys.exit(1)
+
+	try_again = True
+	meta_succeed = False
+	max_tries = 3
+	tries = 0
+	exit_code = 0
+
+	while tries <= max_tries and try_again:
+
+		try:
+			tries += 1
+			fetch_queue = Queue.Queue(maxsize=50)
+			meta_queue = Queue.Queue()
+			uparser = UbuntuAPTParser(
+					logger,
+					opts.destination,
+					workers=opts.workers,
+					dists=opts.distro,
+					subdir=opts.dir,
+					srcdir=opts.src_dir,
+					creds=creds,
+					server=socket.gethostbyname(opts.server),
+					parse_meta=opts.meta_parse,
+					meta_only=opts.meta_only,
+					no_meta=opts.no_meta,
+					delete_delay=opts.delete_delay,
+					purge_old=opts.purge_old)
+
+			uparser.run(fetch_queue, meta_queue, db_loc=opts.db_loc)
+
+			try_again = False
+			meta_succeed = True
+
+		except socket.error as e:
+			logger.critical("Unable to resolve host name for %s" % opts.server)
+			logger.critical(e)
+			exit_code = 6
+
+		except Exception as e:
+			logger.critical("Encountered uncaught error!")
+			logger.critical("Traceback:\n%s" % traceback.format_exc(e))
+
+			if e.args[0] == "META-MISMATCH" or e.args[0] == "META-ERROR":
+				logger.info("Detected meta mismatch between cached meta.")
+				logger.info(("Sleeping for three minutes to try again."
+							"Will try up to %s more times.") % tries)
+				exit_code = 4
+
+			elif "WORKER_ERROR" in  e.args[0]:
+				logger.info("Detected worker thread error.")
+				logger.info(("Sleeping for three minutes to retry. "
+							"Will try try up to %s more times." ) % tries)
+				exit_code = 5
+
+			else:
+				logger.info("Encounter general exception, %s" % e)
+				try_again = False
+				exit_code = 6
+
+
+			if tries > max_tries:
+				logger.critical(("Reached max tries, Unable to get a good upload, "
+								"this may be fatal."))
+
+
+	sys.exit( exit_code )

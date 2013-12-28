@@ -1,0 +1,6 @@
+#cloud-config
+ssh_import_id: [utlemming]
+packages:
+- bzr
+- postfix
+- mailutils

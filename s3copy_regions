@@ -1,0 +1,146 @@
+#!/usr/bin/python
+# vi: ts=4 noexpandtab
+
+## Copyright (C) 2011 Ben Howard <ben.howard@canonical.com>
+## Date: 25 October 2011
+##
+## Script for doing builds with live-build system in an automated fashion
+## This comes with ABSOLUTELY NO WARRANTY; for details see COPYING.
+## This is free software, and you are welcome to redistribute it
+## under certain conditions; see copying for details.
+import sys
+my_boto_ver = "boto-2.1.1"
+my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
+sys.path.append( sys.path[0] )
+sys.path[0] = my_boto_path
+
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
+from boto.s3.bucket import Bucket
+from s3copyworker import S3CopyWorker
+
+import argparse
+import logging
+import re
+import Queue
+
+logging.basicConfig(format='%(asctime)s %(levelname)s - %(threadName)s - %(message)s')
+logger = logging.getLogger('_s3copier')
+logger.setLevel(logging.DEBUG)
+
+def main(from_buck, root, to_buck, access_key, secret_key, max_threads=32, nostage=False):
+	logger.info("Starting S3 intra-region copy process")
+	logger.info("Establishing connections to buckets")
+	creds = access_key, secret_key
+	conn = S3Connection( access_key, secret_key )
+	logger.debug("Connections established")
+	meta_re = re.compile(".*/Release$|.*/Release.gpg$|.*/Packages\.(bz2|gz)$|.*/Source\.[g,b]z$|./Contents-amd64$|./Contents-i386$")
+
+	bucket_contents = {}
+	meta_contents = {}
+
+	'''get the contents of existing buckets'''
+	logger.info("Gathering contents of destination buckets")
+	for to in to_buck:
+		logger.info("Looking at %s" % to )
+		to_bucket = conn.get_bucket( to )
+		keys = {}
+		meta = {}
+
+		for key in to_bucket.list(prefix=root):
+			if meta_re.match( key.name ) and nostage:
+				meta[key.name] = str( key.etag ).replace('"','')
+
+			else:
+				keys[key.name] = str( key.etag ).replace('"','')
+
+		bucket_contents[ to ] = keys
+		meta_contents[ to ] = meta
+
+		logger.info("Found %s regular keys in %s" % ( len( bucket_contents[ to ] ), to ))
+		logger.info("Found %s metadata keys in %s" % ( len( meta_contents[ to ] ), to ))
+
+	"""
+	Populate a queue of tuples. Where x[0] is the key name, x[1] is the MD5 and x[2] is an list of buckets
+		Also, it takes removes items from the fetched list in order to calculate which files need to be purged
+		post-run
+	"""
+	dest_populated = {}
+	work_queue = Queue.Queue()
+	meta_queue = Queue.Queue()
+	logger.info("Populating source queue...")
+	source_bucket = conn.get_bucket(from_buck)
+
+	for key in source_bucket.list(prefix=root):
+		anon_bucket = []
+
+		if meta_re.match( key.name ):
+			logger.info("Found meta item %s" % key.name)
+			for to in meta_contents:
+				if key.name in meta_contents[ to ]:
+					if str( key.etag ).replace('"','') != meta_contents[ to ][ key.name ]:
+						anon_bucket.append( to )
+
+					meta_contents[ to ].remove( key.name )
+
+				else:
+					anon_bucket.append( to )
+
+			if len( anon_bucket ) > 0:
+				anon_item = key.name, key.etag.replace('"',''), anon_bucket
+				meta_queue.put( anon_item )
+
+		else:
+			for to in bucket_contents:
+				if key.name in bucket_contents[ to ]:
+					if str( key.etag ).replace('"','') != bucket_contents[ to ][ key.name ]:
+						anon_bucket.append( to )
+
+					del	bucket_contents[ to ][ key.name ]
+
+				else:
+					anon_bucket.append( to )
+
+			if len( anon_bucket ) > 0:
+				anon_item = key.name, key.etag.replace('"',''), anon_bucket
+				work_queue.put( anon_item )
+
+
+	'''now off to the uploads'''
+	logger.info("Regular queue has %s items" % work_queue.qsize())
+	logger.info("Meta-data queue has %s items" % meta_queue.qsize())
+
+	for to in bucket_contents:
+		logger.info("Destination bucket %s has %s items for removal" % ( to, len( bucket_contents[ to ] )))
+
+	'''Fire-up the low-orbit ion cananons'''
+	for i in range(max_threads):
+		logger.debug("Starting worker thread [ %s/%s ]" % ( i, max_threads ))
+		copier = S3CopyWorker(work_queue, from_buck, logger, creds, qtype="REGULAR", prestage=nostage )
+		copier.daemon = True
+		copier.start()
+
+	work_queue.join()
+
+	for i in range(max_threads):
+		logger.debug("Starting worker thread [ %s/%s ]" % ( i, max_threads ))
+		copier = S3CopyWorker(meta_queue, from_buck, logger, creds, qtype="META", prestage=nostage )
+		copier.daemon = True
+		copier.start()
+
+	work_queue.join()
+
+if __name__=="__main__":
+	parser = argparse.ArgumentParser()
+
+	parser.add_argument('--source', action="store", help="Source bucket")
+	parser.add_argument('--root', action="store", help="Subdirectory to copy", default="")
+	parser.add_argument('--destination', action="append", help="Destination bucket")
+	parser.add_argument('--secret_key', action="store", help="AWS Secret Key")
+	parser.add_argument('--access_key', action="store", help="AWS Access Key")
+	parser.add_argument('--threads', action="store", help="Number of worker threads", type=int, default=32)
+	parser.add_argument('--no_stage', action="store_true", default="False")
+
+	results = parser.parse_args()
+	main(results.source, results.root, results.destination, results.access_key, results.secret_key, results.threads, nostage=results.no_stage)
+

@@ -1,0 +1,222 @@
+#!/bin/bash
+
+VERBOSITY=0
+TEMP_D=""
+RELEASES=( $(ubuntu-distro-info --supported 2>/dev/null ) )
+MIRRORS=( http://archive.ubuntu.com/ubuntu )
+DNS=""
+
+error() { echo "$@" 1>&2; }
+fail() { [ $# -eq 0 ] || error "$@"; exit 1; }
+
+get() { 
+	if [ $# -eq 2 ]; then
+		wget "$1" --header "Host: $2" -q -O -;
+	else
+		wget "$1" -q -O -;
+	fi
+}
+	
+is_ipv4() {
+	echo "$1" | egrep -q "[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}"
+}
+get_release_md5s() {
+	local rel="$1" mirror="$2" host="$3" mdir="$4"
+	local base="" dir=""
+	local m="" md5sum="" size="" file="" dlfail=0
+	local cur="" last="" mmis=0 smis=0
+	shift;
+	debug 1 "$rel: ${mirror}"
+	mirror="${mirror%/}"
+	dir="$mdir/dists/$rel"
+	mkdir -p "$dir" || { error "failed to mkdir $dir"; return 1; }
+	base="$mirror/dists/$rel"
+	get "$base/Release" $host > "$dir/Release" || {
+		error "can't get $base/Release";
+		echo "1" > "$mdir/$rel.status.dlfail"
+		return 1;
+	}
+	get "$mirror" $host > "$mdir/$rel.index"
+	egrep "^[ ][a-f0-9]{32}[ ]" "$dir/Release" > "$dir/md5sums"
+	while read md5sum size file; do
+		case "$file" in
+			*/debian-installer/*) continue;;
+			*/binary-i386/Packages.bz2|*/binary-amd64/Packages.bz2) :;;
+			*) continue;;
+		esac
+		m=$(dirname "$dir/$file")
+		[ -d "$m" ] || mkdir -p "$m"
+		debug 2 " $base/$file" 
+		if ! get "$base/$file" $host > "$dir/$file"; then
+			error "fail: $base/$file failed download"; 
+			dlfail=$(($dlfail+1));
+			continue
+		fi
+		echo "$md5sum  $file" >> "$dir/MD5SUMS"
+	done < "$dir/md5sums"
+	if ! ( cd "$dir" && md5sum -c MD5SUMS > MD5SUMS.error); then
+		error "FAIL: $rel: $mirror is inconsistent in itself"
+		sed -n "/FAILED/s,^,| ,p" "$dir/MD5SUMS.error"
+        smis=1
+	fi
+	cur=$(md5sum $dir/Release | awk '{print $1}')
+	m=$(md5sum $dir/Release | awk '{print $1}')
+	echo "$m $base" > "$mdir/$rel.relsum"
+	debug 1 "$m $base"
+
+	echo "$dlfail" > "$mdir/$rel.status.dlfail"
+	echo "$smis" > "$mdir/$rel.status.consistent"
+	[ $smis = 0 -a $dlfail = 0 ] && return 0 || return 1
+}
+
+Usage() {
+	cat <<EOF
+Usage: ${0##*/} [ options ] [ release-or-release [ mirror-or-release .. ]]
+
+   Check consistency of a mirror (including round-robin)
+   by default check all of (ubuntu-distro-info --supported)
+      ${RELEASES[@]}
+
+   default mirrors:
+      ${MIRRORS[@]}
+
+   options:
+      -s | --save     D   save output to D. otherwise, only tempdir
+      -d | --dns      H   do dnslookups from 'H' (default is none)
+                          consider '8.8.8.8'. use '0' for "do not lookup IPs"
+EOF
+}
+
+bad_Usage() { Usage 1>&2; [ $# -eq 0 ] || error "$@"; exit 1; }
+cleanup() {
+	local pids=""
+	pids=$(jobs -rp)
+	[ -z "$pids" ] || kill $pids
+	[ -z "${TEMP_D}" -o ! -d "${TEMP_D}" ] || rm -Rf "${TEMP_D}"
+}
+
+debug() {
+	local level=${1}; shift;
+	[ "${level}" -gt "${VERBOSITY}" ] && return
+	error "${@}"
+}
+
+short_opts="hd:o:s:v"
+long_opts="help,dns:,output:,save:,verbose"
+getopt_out=$(getopt --name "${0##*/}" \
+	--options "${short_opts}" --long "${long_opts}" -- "$@") &&
+	eval set -- "${getopt_out}" ||
+	bad_Usage
+
+## <<insert default variables here>>
+output=""
+mirrors=( )
+dns=""
+save=""
+
+while [ $# -ne 0 ]; do
+	cur=${1}; next=${2};
+	case "$cur" in
+		-h|--help) Usage ; exit 0;;
+		-o|--output) output=${2}; shift;;
+		-s|--save) save=${2}; shift;;
+		-v|--verbose) VERBOSITY=$((${VERBOSITY}+1));;
+		-d|--dns) dns=$next;;
+		--) shift; break;;
+	esac
+	shift;
+done
+
+while [ $# -ne 0 ]; do
+	case "$1" in
+		http*|ftp*) mirrors[${#mirrors[@]}]=$1;;
+		*) releases[${#releases[@]}]=$1;;
+	esac
+	shift
+done
+
+## check arguments here
+if [ ${#releases[@]} -eq 0 ]; then
+	releases=( "${RELEASES[@]}" )
+	[ ${#releases} -eq 0 ] &&
+		fail "provide release or get ubuntu-distro-info"
+fi
+
+[ -n "$dns" ] || dns="${DNS}"
+
+[ "${#mirrors[@]}" -eq 0 ] && mirrors=( "${MIRRORS[@]}" )
+
+for m in "${mirrors[@]}"; do
+	case "$m" in
+		http://*|https://*)
+			pre=${m%%//*}//;
+			host=${m#*//}; host=${host%%/*};
+			[ "${host#*:}" != "${host}" ] && host=${host%:*} && port=${port#*:} ||
+				{ host=${host} && port=""; }
+			path=${m#${pre}${host}${port:+:${port}}}
+			;;
+		*) pre="http://"; host=${m}; port=""; path="/ubuntu";;
+	esac
+	if [ "$dns" = "0" ]; then
+		m_ips="$host"
+	elif is_ipv4 "$host"; then
+		m_ips=( $host )
+	else
+		h_out=$(host "$host" ${dns:+"${dns}"}) && [ -n "$h_out" ] &&
+			m_ips=$(echo "$h_out" | awk '$0 ~ /has address/ { print $4 }' | sort) &&
+			[ -n "$m_ips" ] || fail "dns lookup of $host failed"
+		m_ips=( ${m_ips} )
+	fi
+	debug 1 "$m had mirrors:" "${m_ips[@]}"
+	for ip in "${m_ips[@]}"; do
+		urls=( "${urls[@]}" "${pre}${ip}${port:+:${port}}${path}" )
+		hosts[${#hosts[@]}]=${host}
+	done
+	ips=( "${ips[@]}" "${m_ips[@]}" )
+done
+
+if [ -n "$save" ]; then
+	mkdir -p "$save"
+	cd "$save"
+else
+	TEMP_D=$(mktemp -d "${TMPDIR:-/tmp}/${0##*/}.XXXXXX") ||
+		fail "failed to make tempdir"
+	cd "${TEMP_D}"
+fi
+trap cleanup EXIT
+
+fail=0
+for rel in "${releases[@]}"; do
+	for((i=0;i<${#urls[@]};i++)); do
+		mirror=${urls[$i]}
+		host=${hosts[$i]}
+		mdir=$(echo "$mirror" | sed 's,/,_,g')
+		get_release_md5s "$rel" "${mirror}" "$host" "${mdir}" &
+	done
+	wait
+	for mirror in "${urls[@]}"; do
+		mdir=$(echo "$mirror" | sed 's,/,_,g')
+		read s < "$mdir/$rel.status.consistent"
+		[ $s -eq 0 ] ||
+			{ error "INCONSISTENT: $mirror"; fail=$(($fail+1)); }
+		if [ -e "$mdir/$rel.status.dlfail" ]; then
+			read s < "$mdir/$rel.status.dlfail"
+			[ $s -eq 0 ] ||
+				{ error "DOWNLOAD_FAIL: $mirror"; fail=$(($fail+1)); }
+		fi
+		cat "$mdir/$rel.relsum"
+	done
+
+	last=""; mirrors_synced=1;
+	for mirror in "${urls[@]}"; do
+		mdir=$(echo "$mirror" | sed 's,/,_,g')
+		read sum file < "$mdir/$rel.relsum"
+		[ -z "$last" -o "$sum" = "$last" ] ||
+			{ mirrors_synced=0; fail=$(($fail+1)); }
+		last=$sum
+	done
+	[ "$mirrors_synced" = "1" ] || error "OUT_OF_SYNC: $rel"
+done
+exit $fail
+
+# vi: ts=4 noexpandtab
