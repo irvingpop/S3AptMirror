@@ -10,10 +10,6 @@
 
 ## Mirrors apt repositories to Amazon S3
 import sys
-my_boto_ver = "boto-2.1.1"
-my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
-sys.path.append( sys.path[0] )
-sys.path[0] = my_boto_path
 
 from aptmetaworker import MetaS3Worker
 from http2s3worker import HTTP2S3Worker
@@ -56,8 +52,8 @@ def hash_name( name ):
 
 
 class UbuntuAPTParser():
-	def __init__(self, logger, destination, urlbase=None, dists=None,
-			workers=16, creds=None, subdir='ubuntu', srcdir='ubuntu', server='archive.ubuntu.com', parse_meta=False,
+	def __init__(self, logger, destination, urlbase=None, dists=None, subrepos=None,
+			workers=16, creds=None, subdir='ubuntu', srcdir='ubuntu', server='http://archive.ubuntu.com/ubuntu/', parse_meta=False,
 			meta_only=False, no_meta=False, delete_delay=3, purge_old=False):
 
 		"""
@@ -81,15 +77,16 @@ class UbuntuAPTParser():
 
 		self.logger = logger
 		self.server = server
-		self.urlbase = "http://%s/ubuntu/dists" % self.server
-		self.distributions = [ "oneiric", "lucid", "hardy", "precise", "saucy" ]
-		self.subrepo = [ "backports", "proposed", "security", "updates" ]
+		#self.urlbase = "http://%s/ubuntu/dists" % self.server
+		self.urlbase = "%s/%s" % ( self.server, "dists" )
+		self.distributions = [ ]
+		self.subrepo = [ ]
 		self.dists = []
 		self.meta_parse_only = parse_meta
 		self.destination =  destination
 		self.workers = workers
 		self.subdir = subdir
-		self.srcdir = srcdir
+		# self.srcdir = srcdir
 		self.creds = creds
 		self.queue = Queue.Queue()
 		self.meta_only = meta_only
@@ -102,7 +99,10 @@ class UbuntuAPTParser():
 			self.urlbase = urlbase
 
 		if dists is not None:
-			self.distributions = dists.split()
+			self.distributions = dists.split(',')
+
+		if subrepos is not None:
+			self.subrepo = subrepos.split(',')
 
 		if self.creds is None:
 			raise Exception("NO_CREDENTIALS", "S3 Credentials not provided")
@@ -166,7 +166,7 @@ class UbuntuAPTParser():
 				anon = S3UploadObject()
 				anon.set_value('remote_url', "%s/%s" % ( url_base, extra ))
 				anon.set_value('key_name', "%s/%s" % ( key_base, extra ))
-				anon.set_value('temp_name', "%s_%s_%s" % ( self.subdir, dist, extra ))
+				anon.set_value('temp_name', "%s_%s_%s" % ( self.subdir.replace('/', '_'), dist, extra ))
 				queue.put(anon)
 
 			for n in range(self.workers):
@@ -178,7 +178,7 @@ class UbuntuAPTParser():
 						temp_meta_queue,
 						tempdir,
 						self.server,
-						self.srcdir,
+						# self.srcdir,
 						self.subdir,
 						error)
 
@@ -578,26 +578,23 @@ class UbuntuAPTParser():
 if __name__ == "__main__":
 
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--print_urls', action="store_true", default=False,
-		help="Print URLS to work on and exit")
-	parser.add_argument('--workers', action="store", default=16, type=int,
-		help="Number of workers to process meta-data")
+	parser.add_argument('--server', action="store",
+		default="http://archive.ubuntu.com/ubuntu/", help="Server URL to mirror from")
 	parser.add_argument('--distro', action="store",
-		default="lucid oneiric precise quantal raring saucy trusty",
-		help="Distributions to mirror")
+		default="lucid,oneiric,precise,quantal,raring,saucy,trusty", help="Distributions to mirror(comma-separate list)")
+	parser.add_argument('--subrepos', action="store",
+		default="", help="Sub-repos to mirror(comma-separate list)")
+		# default="backports,proposed,security,updates", help="Sub-repos to mirror(comma-separate list)")
 	parser.add_argument('--destination', action="store",
 		help="Destination bucket on S3")
+	parser.add_argument('--dir', action="store", default="ubuntu",
+		help="Bucket sub directory to store files")
 	parser.add_argument('--secret_key', action="store",
 		help="AWS Secret Key")
 	parser.add_argument('--access_key', action="store",
 		help="AWS Access Key/ID")
-	parser.add_argument('--src_dir', action="store", default="ubuntu",
-		help="Remote location directory where files are")
-	parser.add_argument('--dir', action="store", default="ubuntu",
-		help="Bucket sub directory to store files")
-	parser.add_argument('--server', action="store",
-		default="archive.ubuntu.com",
-		help="Server to mirror from")
+	# parser.add_argument('--src_dir', action="store", default="ubuntu",
+	# 	help="Remote location directory where files are")
 	parser.add_argument('--meta_parse', action="store_true", default=False,
 		help="Only parse meta-data")
 	parser.add_argument('--meta_only', action="store_true", default=False,
@@ -606,7 +603,7 @@ if __name__ == "__main__":
 		help="Upload new files, but skip meta data")
 	parser.add_argument('--purge_old', action="store_true", default=False,
 		help="Purge files not referenced in current meta-data")
-	parser.add_argument('--delete_delay', action="store", default=3,
+	parser.add_argument('--delete_delay', action="store", default=30,
 		help="Number of days to wait before a file is eligible for purging")
 	parser.add_argument('--log', action="store",
 		default="/tmp/apt2s3mirror-%s.log" % run_stamp,
@@ -615,6 +612,10 @@ if __name__ == "__main__":
 		help="Location to store the temp DB for processing meta-data")
 	parser.add_argument('--silent', action="store_true", default=False,
 		help="Disable on-screen logging, useful for automated runs")
+	parser.add_argument('--print_urls', action="store_true", default=False,
+		help="Print URLS to work on and exit")
+	parser.add_argument('--workers', action="store", default=16, type=int,
+		help="Number of workers to process meta-data")
 
 	opts = parser.parse_args()
 
@@ -665,9 +666,9 @@ if __name__ == "__main__":
 					workers=opts.workers,
 					dists=opts.distro,
 					subdir=opts.dir,
-					srcdir=opts.src_dir,
+					# srcdir=opts.src_dir,
 					creds=creds,
-					server=socket.gethostbyname(opts.server),
+					server=opts.server,
 					parse_meta=opts.meta_parse,
 					meta_only=opts.meta_only,
 					no_meta=opts.no_meta,
@@ -679,10 +680,10 @@ if __name__ == "__main__":
 			try_again = False
 			meta_succeed = True
 
-		except socket.error as e:
-			logger.critical("Unable to resolve host name for %s" % opts.server)
-			logger.critical(e)
-			exit_code = 6
+		# except socket.error as e:
+		# 	logger.critical("Unable to resolve host name for %s" % opts.server)
+		# 	logger.critical(e)
+		# 	exit_code = 6
 
 		except Exception as e:
 			logger.critical("Encountered uncaught error!")

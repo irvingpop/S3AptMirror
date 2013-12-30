@@ -10,10 +10,6 @@
 
 ## Mirrors apt repositories to Amazon S3
 import sys
-my_boto_ver = "boto-2.1.1"
-my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
-sys.path.append( sys.path[0] )
-sys.path[0] = my_boto_path
 
 from aptmetaworker import MetaS3Worker
 from http2s3worker import HTTP2S3Worker
@@ -57,8 +53,9 @@ class APTReleaseParser():
 	def parse(self, url, url_base, key_name, key_base, queue):
 		start_md5_re = re.compile('^MD5Sum:$')
 		stop_md5_re = re.compile('^SHA1:$')
-		match_re = re.compile('.*binary-amd64.*|.*binary-i386.*|.*source.*|.*sources.*|.*i18n.*')
-		excluded_re = re.compile('.*debian-installer.*|.*(Sources|Packages)$')
+		# TODO(irving): make it optional to fetch source/sources
+		match_re = re.compile('.*binary-amd64.*|.*binary-i386.*|.*i18n.*')
+		excluded_re = re.compile('.*debian-installer.*|.*(Sources|Packages)$|.*source.*|.*sources.*')
 
 		try:
 			http = urllib3.PoolManager()

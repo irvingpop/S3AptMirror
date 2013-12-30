@@ -8,10 +8,6 @@
 ## This is free software, and you are welcome to redistribute it
 ## under certain conditions; see copying for details.
 import sys
-my_boto_ver = "boto-2.1.1"
-my_boto_path = "%s/%s" % ( sys.path[0], my_boto_ver )
-sys.path.append( sys.path[0] )
-sys.path[0] = my_boto_path
 
 import threading
 import tempfile
@@ -201,13 +197,14 @@ class HTTP2S3Worker(threading.Thread):
 						k1 = Key(to_buck)
 						k1.key = rname
 
-						'''fix for wget/curl type clients'''
-						k1.copy( self.dest_bucket, rname.replace("+", " ") )
-						self.logger.info("EXTRA copy as %s" % rname.replace("+"," "))
+						# TODO (irving): Figure out if/why this is still needed.  Don't need X3 storage usage if we can help it
+						# '''fix for wget/curl type clients'''
+						# k1.copy( self.dest_bucket, rname.replace("+", " ") )
+						# self.logger.info("EXTRA copy as %s" % rname.replace("+"," "))
 
-						'''fix for apt/iso-8859-1'''
-						k1.copy( self.dest_bucket, rname.replace("+", "%2B") )
-						self.logger.info("EXTRA copy as %s" % rname.replace("+","%2B"))
+						# '''fix for apt/iso-8859-1'''
+						# k1.copy( self.dest_bucket, rname.replace("+", "%2B") )
+						# self.logger.info("EXTRA copy as %s" % rname.replace("+","%2B"))
 
 						k1.close()
 
