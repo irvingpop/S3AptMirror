@@ -166,7 +166,7 @@ class UbuntuAPTParser():
 				anon = S3UploadObject()
 				anon.set_value('remote_url', "%s/%s" % ( url_base, extra ))
 				anon.set_value('key_name', "%s/%s" % ( key_base, extra ))
-				anon.set_value('temp_name', "%s_%s_%s" % ( self.subdir, dist, extra ))
+				anon.set_value('temp_name', "%s_%s_%s" % ( self.subdir.replace('/', '_'), dist, extra ))
 				queue.put(anon)
 
 			for n in range(self.workers):
