@@ -36,10 +36,9 @@ class APTParserWorker(threading.Thread):
 	Thread worker for parsing over a queue of URLs to get meta information for an APT repo
 	"""
 
-	def __init__(self, logger, work_queue, fetch_queue, meta_queue, tempdir, server, srcdir, dstdir, error):
+	def __init__(self, logger, work_queue, fetch_queue, meta_queue, tempdir, server, dstdir, error):
 		threading.Thread.__init__(self)
 		self.server = server
-		self.srcdir = srcdir
 		self.dstdir = dstdir
 		self.error = error
 		self._stop = threading.Event()
@@ -112,7 +111,7 @@ class APTParserWorker(threading.Thread):
 						s3obj  = S3UploadObject()
 						s3obj.set_value("name", pname )
 						s3obj.set_value("key_name", "%s/%s/%s" % ( self.dstdir, currdir, pname ))
-						s3obj.set_value("remote_url", "http://%s/%s/%s/%s" % ( self.server, self.srcdir, currdir, pname ))
+						s3obj.set_value("remote_url", "%s/%s/%s" % ( self.server, currdir, pname ))
 						s3obj.set_value("remote_md5", md5 )
 						s3obj.set_value("remote_size", size )
 						fetch_queue.put( s3obj )
@@ -159,7 +158,7 @@ class APTParserWorker(threading.Thread):
 					s3obj = S3UploadObject()
 					s3obj.set_value("name", currfile)
 					s3obj.set_value("key_name", "%s/%s" % ( self.dstdir, currfile ))
-					s3obj.set_value("remote_url", "http://%s/%s/%s" % ( self.server, self.srcdir, currfile ))
+					s3obj.set_value("remote_url", "%s/%s" % ( self.server, currfile ))
 					s3obj.set_value("remote_size", currsize )
 					s3obj.set_value("remote_md5", str( line.split(' ')[1] ).rstrip() )
 					fetch_queue.put( s3obj )
