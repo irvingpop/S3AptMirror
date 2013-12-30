@@ -53,8 +53,9 @@ class APTReleaseParser():
 	def parse(self, url, url_base, key_name, key_base, queue):
 		start_md5_re = re.compile('^MD5Sum:$')
 		stop_md5_re = re.compile('^SHA1:$')
-		match_re = re.compile('.*binary-amd64.*|.*binary-i386.*|.*source.*|.*sources.*|.*i18n.*')
-		excluded_re = re.compile('.*debian-installer.*|.*(Sources|Packages)$')
+		# TODO(irving): make it optional to fetch source/sources
+		match_re = re.compile('.*binary-amd64.*|.*binary-i386.*|.*i18n.*')
+		excluded_re = re.compile('.*debian-installer.*|.*(Sources|Packages)$|.*source.*|.*sources.*')
 
 		try:
 			http = urllib3.PoolManager()
