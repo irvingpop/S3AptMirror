@@ -103,13 +103,14 @@ class S3SyncWorker(threading.Thread):
 						k1 = Key(to_buck)
 						k1.key = name
 
-						'''fix for wget/curl type clients'''
-						k1.copy( self.dest_bucket, name.replace("+", " ") )
-						self.logger.info("%s - EXTRA copy as %s" % ( self.name, name.replace("+"," ") ))
+						# TODO (irving): Figure out if/why this is still needed.  Don't need X3 storage usage if we can help it
+						# '''fix for wget/curl type clients'''
+						# k1.copy( self.dest_bucket, name.replace("+", " ") )
+						# self.logger.info("%s - EXTRA copy as %s" % ( self.name, name.replace("+"," ") ))
 
-						'''fix for apt/iso-8859-1'''
-						k1.copy( self.dest_bucket, name.replace("+", "%2B") )
-						self.logger.info("%s - EXTRA copy as %s" % ( self.name, name.replace("+","%2B") ))
+						# '''fix for apt/iso-8859-1'''
+						# k1.copy( self.dest_bucket, name.replace("+", "%2B") )
+						# self.logger.info("%s - EXTRA copy as %s" % ( self.name, name.replace("+","%2B") ))
 
 				except boto.exception.AWSConnectionError, e:
 					self.logger.error("FAILED connection %s" % self.name )
