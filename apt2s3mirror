@@ -666,7 +666,7 @@ if __name__ == "__main__":
 					workers=opts.workers,
 					dists=opts.distro,
 					subdir=opts.dir,
-					# srcdir=opts.src_dir,
+					subrepos=opts.subrepos,
 					creds=creds,
 					server=opts.server,
 					parse_meta=opts.meta_parse,
